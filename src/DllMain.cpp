@@ -14,8 +14,10 @@
 // Race/world manager (global pointer, RVA 0x3361F8):
 //   mgr + 0x18          int    number of car entities
 //   mgr + 0x28 + i*4    DWORD  car entity pointer [i]
-// The game finds the local player by entity id (global int, RVA 0x2FBF18):
-// each entity stores a short id at +0x0A. See FUN_0041ffe0 / FUN_00489690.
+// Each entity carries a short id at +0x0A. The local player's entity has
+// id 0; AI and remote racers use 100+ (verified live in memory). The game's
+// own id global at RVA 0x2FBF18 stays -1 in offline play and must not be
+// used for the lookup.
 //
 // Car entity (the object in the manager array):
 //   +0x0A        short  entity id (matched against the local player id)
@@ -35,9 +37,7 @@
 // ============================================================================
 namespace game {
     constexpr uintptr_t WORLD_MANAGER_PTR = 0x3361F8;
-    constexpr uintptr_t LOCAL_PLAYER_ID   = 0x2FBF18;
     constexpr uintptr_t PAUSE_FLAG        = 0x3041C4;
-    constexpr uintptr_t METRIC_UNITS      = 0x38A3F5;
 
     constexpr intptr_t  ENT_ID            = 0x0A;
     constexpr intptr_t  ENT_SPEED_MS      = 0x3D4;
@@ -57,12 +57,9 @@ namespace game {
         return Readable(flag, 1) && *flag == 1;
     }
 
-    static bool IsMetricUnits(uintptr_t base) {
-        const uint8_t* flag = reinterpret_cast<const uint8_t*>(base + METRIC_UNITS);
-        return Readable(flag, 1) && *flag == 1;
-    }
-
     // Resolves the local player's car entity for this frame, or 0.
+    // The local player is the entity carrying short id 0 (AI/remote use
+    // 100+); if the id layout ever differs, fall back to the first entity.
     static uintptr_t FindPlayerEntity(uintptr_t base) {
         uintptr_t* mgrPtr = reinterpret_cast<uintptr_t*>(base + WORLD_MANAGER_PTR);
         if (!Readable(mgrPtr, 4)) return 0;
@@ -73,23 +70,23 @@ namespace game {
         int count = *reinterpret_cast<int*>(mgr + 0x18);
         if (count <= 0 || count > MAX_ENTITIES) return 0;
 
-        const int* idPtr = reinterpret_cast<const int*>(base + LOCAL_PLAYER_ID);
-        if (!Readable(idPtr, 4)) return 0;
-        int playerId = *idPtr;
-        if (playerId < 0) return 0;
-
         uintptr_t entries = mgr + 0x28;
         if (!Readable(reinterpret_cast<const void*>(entries), count * 4)) return 0;
 
+        uintptr_t first = 0;
         for (int i = 0; i < count; ++i) {
             uintptr_t ent = *reinterpret_cast<uintptr_t*>(entries + i * 4);
             if (ent == 0) continue;
             if (!Readable(reinterpret_cast<const void*>(ent + ENT_ID), 2)) continue;
-            if (static_cast<int>(*reinterpret_cast<short*>(ent + ENT_ID)) != playerId) continue;
-            if (!Readable(reinterpret_cast<const void*>(ent + ENT_NITRO_CURRENT), 0x10)) continue;
-            return ent;
+            if (first == 0) first = ent;
+            if (*reinterpret_cast<short*>(ent + ENT_ID) == 0) {
+                first = ent;
+                break;
+            }
         }
-        return 0;
+        if (first == 0) return 0;
+        if (!Readable(reinterpret_cast<const void*>(first + ENT_NITRO_CURRENT), 0x10)) return 0;
+        return first;
     }
 }
 
@@ -134,7 +131,10 @@ static void NitrousUpdaterThread() {
 
     const int updateIntervalMs = 25;
     const DWORD cooldownMs = g_fastRefill ? 1000 : 2000;
-    const DWORD unpauseBufferMs = 500;
+    // The game freezes for roughly half a second right after unpausing.
+    // Refilling during that freeze shows up as an instant nitrous jump,
+    // so hold the refill for 1s total after unpausing.
+    const DWORD unpauseBufferMs = 1000;
 
     int lastNitroValue = -1;
     ULONGLONG lastDecreaseTime = 0;
@@ -210,10 +210,11 @@ static void NitrousUpdaterThread() {
         }
         lastNitroValue = currentValue;
 
-        // Speed as displayed on the HUD (mph or km/h depending on game options).
+        // Speed converted to mph. The tuning thresholds below (50-100) were
+        // authored for mph, so always use the mph scale regardless of what
+        // the HUD displays (the game's km/h option only affects the readout).
         const float speedMs = *reinterpret_cast<float*>(ent + game::ENT_SPEED_MS);
-        const float unitScale = game::IsMetricUnits(gameBase) ? 3.6f : 2.237f;
-        const int carSpeed = static_cast<int>(speedMs * unitScale);
+        const int carSpeed = static_cast<int>(speedMs * 2.237f);
 
         int minSpeed = g_fastRefill ? 20 : 50;
         int maxSpeed = g_fastRefill ? 140 : 100;
@@ -229,9 +230,13 @@ static void NitrousUpdaterThread() {
         double t = (clampedSpeed - minSpeed) / static_cast<double>(maxSpeed - minSpeed);
         double refillTime = minTime + t * (maxTime - minTime);
 
-        // 40 updates per second, so the increment restores a full bar in
-        // refillTime seconds of sustained speed.
-        int refillIncrement = static_cast<int>(maxNitro / (refillTime * 40));
+        // Scale by the real elapsed time so a full bar takes refillTime
+        // seconds regardless of how often the update loop actually runs
+        // (Sleep granularity makes it ~32 Hz instead of a nominal 40 Hz).
+        double dtSec = elapsedTime / 1000.0;
+        if (dtSec > 0.25) dtSec = 0.25;  // ignore huge gaps (loading, stalls)
+        int refillIncrement = static_cast<int>(maxNitro * dtSec / refillTime);
+        if (refillIncrement < 1) refillIncrement = 1;
 
         if ((gameTime - lastDecreaseTime) >= cooldownMs && currentValue < maxNitro) {
             *reinterpret_cast<int*>(nitroAddr) = std::min(currentValue + refillIncrement, maxNitro);
