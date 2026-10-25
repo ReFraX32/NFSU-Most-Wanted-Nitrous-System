@@ -1,182 +1,99 @@
 #define NOMINMAX
 #include <windows.h>
-#include <psapi.h>
-#include <vector>
-#include <thread>
-#include <unordered_map>
-#include <unordered_set>
+#include <algorithm>
+#include <cstdio>
 #include <string>
+#include <thread>
 
-#pragma comment(lib, "psapi.lib")
+// ============================================================================
+// Speed.exe (Need for Speed: Underground 1) static addresses.
+// Recovered by static reverse engineering (Ghidra) and cross-checked against
+// multiple call sites in the game itself. RVAs are relative to the Speed.exe
+// module base (image base 0x400000).
+//
+// Race/world manager (global pointer, RVA 0x3361F8):
+//   mgr + 0x18          int    number of car entities
+//   mgr + 0x28 + i*4    DWORD  car entity pointer [i]
+// The game finds the local player by entity id (global int, RVA 0x2FBF18):
+// each entity stores a short id at +0x0A. See FUN_0041ffe0 / FUN_00489690.
+//
+// Car entity (the object in the manager array):
+//   +0x0A        short  entity id (matched against the local player id)
+//   +0x3D4       float  speed in m/s (the exact value the HUD speedometer
+//                        multiplies by 3.6 for km/h or 2.237 for mph)
+//   +0x3F0       int    nitrous capacity in fixed-point units
+//                        (0x7FFFFFFF sentinel = no nitrous / infinite)
+//   +0x3F4       int    nitrous drain per tick while boosting
+//   +0x3F8       int    nitrous current amount in fixed-point units
+//   +0x3FC       int    boost-active reference (nonzero while boosting)
+// Fixed-point scale in the game code is 0.00025 (4000 units = 1 second of
+// boost). The game's own code reads/writes these ints through fild/fistp.
+//
+// Other globals:
+//   RVA 0x3041C4  byte   pause flag (1 = paused), see FUN_004057c0
+//   RVA 0x38A3F5  byte   metric units option (1 = HUD shows km/h)
+// ============================================================================
+namespace game {
+    constexpr uintptr_t WORLD_MANAGER_PTR = 0x3361F8;
+    constexpr uintptr_t LOCAL_PLAYER_ID   = 0x2FBF18;
+    constexpr uintptr_t PAUSE_FLAG        = 0x3041C4;
+    constexpr uintptr_t METRIC_UNITS      = 0x38A3F5;
 
-struct PointerChain {
-    DWORD baseOffset = 0;
-    std::vector<DWORD> offsets;
-};
+    constexpr intptr_t  ENT_ID            = 0x0A;
+    constexpr intptr_t  ENT_SPEED_MS      = 0x3D4;
+    constexpr intptr_t  ENT_NITRO_MAX     = 0x3F0;
+    constexpr intptr_t  ENT_NITRO_CURRENT = 0x3F8;
+    constexpr intptr_t  ENT_NITRO_BOOSTED = 0x3FC;
+
+    constexpr int NITRO_NO_SENTINEL = 0x7FFFFFFF;
+    constexpr int MAX_ENTITIES = 8;
+
+    static bool Readable(const void* p, size_t len) {
+        return p != nullptr && !IsBadReadPtr(p, len);
+    }
+
+    static bool IsGamePaused(uintptr_t base) {
+        const uint8_t* flag = reinterpret_cast<const uint8_t*>(base + PAUSE_FLAG);
+        return Readable(flag, 1) && *flag == 1;
+    }
+
+    static bool IsMetricUnits(uintptr_t base) {
+        const uint8_t* flag = reinterpret_cast<const uint8_t*>(base + METRIC_UNITS);
+        return Readable(flag, 1) && *flag == 1;
+    }
+
+    // Resolves the local player's car entity for this frame, or 0.
+    static uintptr_t FindPlayerEntity(uintptr_t base) {
+        uintptr_t* mgrPtr = reinterpret_cast<uintptr_t*>(base + WORLD_MANAGER_PTR);
+        if (!Readable(mgrPtr, 4)) return 0;
+
+        uintptr_t mgr = *mgrPtr;
+        if (mgr == 0 || !Readable(reinterpret_cast<const void*>(mgr + 0x18), 8)) return 0;
+
+        int count = *reinterpret_cast<int*>(mgr + 0x18);
+        if (count <= 0 || count > MAX_ENTITIES) return 0;
+
+        const int* idPtr = reinterpret_cast<const int*>(base + LOCAL_PLAYER_ID);
+        if (!Readable(idPtr, 4)) return 0;
+        int playerId = *idPtr;
+        if (playerId < 0) return 0;
+
+        uintptr_t entries = mgr + 0x28;
+        if (!Readable(reinterpret_cast<const void*>(entries), count * 4)) return 0;
+
+        for (int i = 0; i < count; ++i) {
+            uintptr_t ent = *reinterpret_cast<uintptr_t*>(entries + i * 4);
+            if (ent == 0) continue;
+            if (!Readable(reinterpret_cast<const void*>(ent + ENT_ID), 2)) continue;
+            if (static_cast<int>(*reinterpret_cast<short*>(ent + ENT_ID)) != playerId) continue;
+            if (!Readable(reinterpret_cast<const void*>(ent + ENT_NITRO_CURRENT), 0x10)) continue;
+            return ent;
+        }
+        return 0;
+    }
+}
 
 static bool g_fastRefill = false;
-
-static PointerChain g_currentSpeedPointer;
-static bool g_hasValidSpeedPointer = false;
-static ULONGLONG g_lastPointerCheckTime = 0;
-static const ULONGLONG POINTER_CHECK_INTERVAL_MS = 10000;
-
-static uintptr_t ResolvePointer(uintptr_t base, const PointerChain& chain) {
-    uintptr_t addr = base + chain.baseOffset;
-    for (size_t i = 0; i < chain.offsets.size(); ++i) {
-        if (IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(uintptr_t))) {
-            return 0;
-        }
-        addr = *reinterpret_cast<uintptr_t*>(addr);
-        addr += chain.offsets[i];
-    }
-    return addr;
-}
-
-static uintptr_t GetModuleBaseAddress(const wchar_t* moduleName) {
-    HMODULE hMods[1024];
-    HANDLE hProcess = GetCurrentProcess();
-    DWORD cbNeeded;
-    if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-        for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
-            wchar_t szModName[MAX_PATH];
-            if (GetModuleBaseNameW(hProcess, hMods[i], szModName, MAX_PATH)) {
-                if (_wcsicmp(szModName, moduleName) == 0) {
-                    return reinterpret_cast<uintptr_t>(hMods[i]);
-                }
-            }
-        }
-    }
-    return 0;
-}
-
-static bool IsGamePaused(uintptr_t gameBase) {
-    uintptr_t pauseFlagAddr = gameBase + 0x3041C4;
-    if (IsBadReadPtr(reinterpret_cast<void*>(pauseFlagAddr), sizeof(short))) {
-        return false;
-    }
-    short pauseValue = *reinterpret_cast<short*>(pauseFlagAddr);
-    return pauseValue == 1;
-}
-
-static int GetSpeedValue(uintptr_t gameBase, const PointerChain& speedPointer) {
-    uintptr_t speedAddr = ResolvePointer(gameBase, speedPointer);
-    if (speedAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(speedAddr), sizeof(int))) {
-        return *reinterpret_cast<int*>(speedAddr);
-    }
-    return -999;
-}
-
-static bool IsPointerValid(uintptr_t gameBase, const PointerChain& speedPointer) {
-    uintptr_t speedAddr = ResolvePointer(gameBase, speedPointer);
-    return (speedAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(speedAddr), sizeof(int)));
-}
-
-static PointerChain GetDefaultSpeedPointer() {
-    return { 0x33D7F4, {0x0, 0x2C, 0x0, 0x0, 0x0, 0x24, 0x58} };
-}
-
-static PointerChain SelectBestSpeedPointer(uintptr_t gameBase) {
-    PointerChain speed1 = { 0x33D7F4, {0x0, 0x2C, 0x0, 0x0, 0x0, 0x24, 0x58} };
-    PointerChain speed2 = { 0x32D1D4, {0x54, 0x44, 0x8, 0x0, 0x76C, 0x24, 0x58} };
-    PointerChain speed3 = { 0x33D7F4, {0xC, 0x20, 0xD4, 0x54, 0x44, 0x0, 0x70} };
-    PointerChain speed4 = { 0x33D7F4, {0x0, 0x2C, 0x0, 0x8, 0x0, 0x1C, 0x58} };
-
-    bool valid1 = IsPointerValid(gameBase, speed1);
-    bool valid2 = IsPointerValid(gameBase, speed2);
-    bool valid3 = IsPointerValid(gameBase, speed3);
-    bool valid4 = IsPointerValid(gameBase, speed4);
-
-    int val1 = valid1 ? GetSpeedValue(gameBase, speed1) : -999;
-    int val2 = valid2 ? GetSpeedValue(gameBase, speed2) : -999;
-    int val3 = valid3 ? GetSpeedValue(gameBase, speed3) : -999;
-    int val4 = valid4 ? GetSpeedValue(gameBase, speed4) : -999;
-
-    bool hasValidPointers = valid1 || valid2 || valid3 || valid4;
-    if (!hasValidPointers) {
-        return GetDefaultSpeedPointer();
-    }
-
-    if (valid1) {
-
-        if (valid2 && val1 == val2) {
-            return speed1;
-        }
-
-        if (valid2 && valid3 && val1 != val2 && val2 == val3) {
-            return speed2;
-        }
-
-        if (!valid2) {
-            if (valid3 && valid4) {
-                if (val1 == val4) {
-                }
-                if (val3 == val4) {
-                }
-            }
-        }
-
-        return speed1;
-    }
-
-    if (valid2) {
-        return speed2;
-    }
-
-    if (valid3) {
-        return speed3;
-    }
-
-    if (valid4) {
-        return speed4;
-    }
-
-    return GetDefaultSpeedPointer();
-}
-
-static void UpdateSpeedPointerDynamic(uintptr_t gameBase, ULONGLONG currentTime) {
-    if (currentTime - g_lastPointerCheckTime < POINTER_CHECK_INTERVAL_MS) {
-        return;
-    }
-
-    g_lastPointerCheckTime = currentTime;
-
-    bool currentPointerStillValid = g_hasValidSpeedPointer &&
-        IsPointerValid(gameBase, g_currentSpeedPointer);
-
-    if (!currentPointerStillValid) {
-        g_currentSpeedPointer = SelectBestSpeedPointer(gameBase);
-        g_hasValidSpeedPointer = IsPointerValid(gameBase, g_currentSpeedPointer);
-        return;
-    }
-
-    PointerChain bestPointer = SelectBestSpeedPointer(gameBase);
-
-    if (bestPointer.baseOffset != g_currentSpeedPointer.baseOffset ||
-        bestPointer.offsets != g_currentSpeedPointer.offsets) {
-
-        if (IsPointerValid(gameBase, bestPointer)) {
-            g_currentSpeedPointer = bestPointer;
-            g_hasValidSpeedPointer = true;
-        }
-    }
-}
-
-static int GetCurrentSpeed(uintptr_t gameBase, ULONGLONG currentTime) {
-    UpdateSpeedPointerDynamic(gameBase, currentTime);
-
-    if (!g_hasValidSpeedPointer) {
-        return -999;
-    }
-
-    int speed = GetSpeedValue(gameBase, g_currentSpeedPointer);
-
-    if (speed == -999) {
-        g_hasValidSpeedPointer = false;
-    }
-
-    return speed;
-}
 
 static void LoadConfig(const std::wstring& iniPath) {
     wchar_t buffer[8] = { 0 };
@@ -207,24 +124,20 @@ static void LoadConfig(const std::wstring& iniPath) {
 }
 
 static void NitrousUpdaterThread() {
-    uintptr_t gameBase = GetModuleBaseAddress(L"Speed.exe");
+    HMODULE hGame = GetModuleHandleW(L"Speed.exe");
+    if (hGame == nullptr) {
+        // Ultimate ASI Loader may run us before Speed.exe is mapped under that name.
+        hGame = GetModuleHandleW(nullptr);
+    }
+    uintptr_t gameBase = reinterpret_cast<uintptr_t>(hGame);
     if (gameBase == 0) return;
-
-    g_currentSpeedPointer = GetDefaultSpeedPointer();
-    g_hasValidSpeedPointer = false;
-    g_lastPointerCheckTime = 0;
-
-    PointerChain nitrousChain = { 0x31A8C0, {0x2C, 0x34, 0x20, 0x8, 0x4, 0x30, 0x3B8} };
-
-    PointerChain maxNitrousPointer = { 0x335F78, {0x50, 0x4, 0x34, 0x4, 0x1C, 0x1C, 0x3B0} };
 
     const int updateIntervalMs = 25;
     const DWORD cooldownMs = g_fastRefill ? 1000 : 2000;
     const DWORD unpauseBufferMs = 500;
 
-    std::unordered_map<uintptr_t, int> lastValues;
-    std::unordered_map<uintptr_t, ULONGLONG> cooldownTimestamps;
-    std::unordered_map<uintptr_t, int> maxValues;
+    int lastNitroValue = -1;
+    ULONGLONG lastDecreaseTime = 0;
 
     ULONGLONG lastUpdateTime = GetTickCount64();
     ULONGLONG gameTime = 0;
@@ -240,7 +153,7 @@ static void NitrousUpdaterThread() {
             continue;
         }
 
-        bool isGamePaused = IsGamePaused(gameBase);
+        bool isGamePaused = game::IsGamePaused(gameBase);
 
         if (wasGamePaused && !isGamePaused) {
             unpauseTime = now;
@@ -265,17 +178,42 @@ static void NitrousUpdaterThread() {
             continue;
         }
 
-        uintptr_t maxNitrousAddr = ResolvePointer(gameBase, maxNitrousPointer);
-        if (maxNitrousAddr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(maxNitrousAddr), sizeof(int))) {
-            maxValues[0] = *reinterpret_cast<int*>(maxNitrousAddr);
-        }
-
-        int carSpeed = GetCurrentSpeed(gameBase, now);
-
-        if (carSpeed == -999) {
+        uintptr_t ent = game::FindPlayerEntity(gameBase);
+        if (ent == 0) {
+            lastNitroValue = -1;
             Sleep(updateIntervalMs);
             continue;
         }
+
+        const int maxNitro = *reinterpret_cast<int*>(ent + game::ENT_NITRO_MAX);
+        if (maxNitro <= 0 || maxNitro == game::NITRO_NO_SENTINEL) {
+            // No nitrous equipped on this car.
+            lastNitroValue = -1;
+            Sleep(updateIntervalMs);
+            continue;
+        }
+
+        const uintptr_t nitroAddr = ent + game::ENT_NITRO_CURRENT;
+        int currentValue = *reinterpret_cast<int*>(nitroAddr);
+        if (currentValue < 0 || currentValue > maxNitro) {
+            lastNitroValue = -1;
+            Sleep(updateIntervalMs);
+            continue;
+        }
+
+        // The game drains this field while boosting; treat any drop (or an
+        // active boost, flagged by the game at +0x3FC) as nitrous usage and
+        // restart the refill cooldown.
+        const bool boosting = *reinterpret_cast<int*>(ent + game::ENT_NITRO_BOOSTED) != 0;
+        if (boosting || (lastNitroValue >= 0 && currentValue < lastNitroValue)) {
+            lastDecreaseTime = gameTime;
+        }
+        lastNitroValue = currentValue;
+
+        // Speed as displayed on the HUD (mph or km/h depending on game options).
+        const float speedMs = *reinterpret_cast<float*>(ent + game::ENT_SPEED_MS);
+        const float unitScale = game::IsMetricUnits(gameBase) ? 3.6f : 2.237f;
+        const int carSpeed = static_cast<int>(speedMs * unitScale);
 
         int minSpeed = g_fastRefill ? 20 : 50;
         int maxSpeed = g_fastRefill ? 140 : 100;
@@ -291,28 +229,12 @@ static void NitrousUpdaterThread() {
         double t = (clampedSpeed - minSpeed) / static_cast<double>(maxSpeed - minSpeed);
         double refillTime = minTime + t * (maxTime - minTime);
 
-        int baseMax = maxValues[0];
-        int refillIncrement = static_cast<int>(baseMax / (refillTime * 40));
+        // 40 updates per second, so the increment restores a full bar in
+        // refillTime seconds of sustained speed.
+        int refillIncrement = static_cast<int>(maxNitro / (refillTime * 40));
 
-        uintptr_t addr = ResolvePointer(gameBase, nitrousChain);
-        if (addr != 0 && !IsBadReadPtr(reinterpret_cast<void*>(addr), sizeof(int))) {
-            if (!IsGamePaused(gameBase) && ((now - unpauseTime) >= unpauseBufferMs)) {
-                int currentValue = *reinterpret_cast<int*>(addr);
-                if (currentValue >= 0 && currentValue <= 99999) {
-                    int& lastValue = lastValues[addr];
-                    ULONGLONG& lastDecreaseTime = cooldownTimestamps[addr];
-
-                    if (currentValue < lastValue) {
-                        lastDecreaseTime = gameTime;
-                    }
-
-                    lastValue = currentValue;
-
-                    if ((gameTime - lastDecreaseTime) >= cooldownMs && currentValue < baseMax) {
-                        *reinterpret_cast<int*>(addr) = std::min(currentValue + refillIncrement, baseMax);
-                    }
-                }
-            }
+        if ((gameTime - lastDecreaseTime) >= cooldownMs && currentValue < maxNitro) {
+            *reinterpret_cast<int*>(nitroAddr) = std::min(currentValue + refillIncrement, maxNitro);
         }
 
         Sleep(updateIntervalMs);
